@@ -23,9 +23,11 @@ import io.agentscope.core.middleware.AgentInput;
 import io.agentscope.core.state.AgentState;
 import io.agentscope.harness.agent.HarnessAgent;
 import io.agentscope.harness.agent.memory.session.SessionTranscriptWriter;
+import io.agentscope.harness.agent.memory.session.SessionTree;
 import io.agentscope.harness.agent.transcript.TranscriptStore;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +44,13 @@ import reactor.core.scheduler.Schedulers;
 public class TranscriptMiddleware implements HarnessRuntimeMiddleware {
 
     private static final Logger log = LoggerFactory.getLogger(TranscriptMiddleware.class);
+
+    /**
+     * Upper bound for draining fire-and-forget transcript/session mirrors at the end of an append.
+     * Mirrors the graceful-shutdown budget in {@code HarnessAgent#close()}; on timeout the append
+     * still completes and the mirror stays asynchronous (pre-existing behavior).
+     */
+    private static final long MIRROR_QUIESCENCE_TIMEOUT_SECONDS = 5;
 
     private final WorkspaceManager workspaceManager;
     private final TranscriptStore transcriptStore;
@@ -102,7 +111,24 @@ public class TranscriptMiddleware implements HarnessRuntimeMiddleware {
                 new SessionTranscriptWriter(workspaceManager, transcriptStore, tenant);
         final String key = agentId;
         return Mono.fromRunnable(() -> writer.appendMessages(rc, messages, key, sessionId))
-                .then()
+                // appendMessages schedules the transcript segment mirror as fire-and-forget work
+                // on the shared single-thread mirror executor. Drain it (bounded) before the
+                // chain completes so a caller that observes call() completion cannot race the
+                // mirror's workspace writes — e.g. a test deleting its temp workspace right
+                // after block(), which the mirror would otherwise recreate from under it.
+                .then(
+                        Mono.fromRunnable(
+                                        () -> {
+                                            if (!SessionTree.awaitMirrorQuiescence(
+                                                    MIRROR_QUIESCENCE_TIMEOUT_SECONDS,
+                                                    TimeUnit.SECONDS)) {
+                                                log.debug(
+                                                        "Transcript mirror did not quiesce within"
+                                                                + " {}s; leaving it asynchronous",
+                                                        MIRROR_QUIESCENCE_TIMEOUT_SECONDS);
+                                            }
+                                        })
+                                .then())
                 .doOnSuccess(v -> log.debug("Transcript append completed"))
                 .onErrorResume(
                         e -> {
